@@ -217,6 +217,8 @@ where
         .boxed();
 
     // PUT /accounts/:username
+    let btp_clone = btp.clone();
+    let outgoing_handler_clone = outgoing_handler.clone();
     let put_account = warp::put()
         .and(warp::path("accounts"))
         .and(account_username_to_id.clone())
@@ -225,8 +227,15 @@ where
         .and(deserialize_json()) // warp::body::json() is not able to decode this!
         .and(with_store.clone())
         .and_then(move |id: Uuid, account_details: AccountDetails, store: S| {
-            let outgoing_handler = outgoing_handler.clone();
-            let btp = btp.clone();
+            let outgoing_handler = outgoing_handler_clone.clone();
+            let btp = btp_clone.clone();
+            if account_details.ilp_over_btp_incoming_token.is_some() {
+                // if the BTP token was provided, assume that it's different
+                // from the existing one and drop the connection
+                // the saved websocket connection
+                // a new one will be initialized in the `connect_to_external_services` call
+                btp.close_connection(&id);
+            }
             async move {
                 let account = store
                     .update_account(id, account_details)
@@ -295,13 +304,15 @@ where
         .boxed();
 
     // DELETE /accounts/:username
+    let btp_clone = btp.clone();
     let delete_account = warp::delete()
         .and(warp::path("accounts"))
         .and(account_username_to_id.clone())
         .and(warp::path::end())
         .and(admin_only)
         .and(with_store.clone())
-        .and_then(|id: Uuid, store: S| {
+        .and_then(move |id: Uuid, store: S| {
+            let btp = btp_clone.clone();
             async move {
                 let account = store
                     .delete_account(id)
@@ -310,12 +321,15 @@ where
                         Rejection::from(ApiError::internal_server_error())
                     })
                     .await?;
+                // close the btp connection (if any)
+                btp.close_connection(&id);
                 Ok::<Json, Rejection>(warp::reply::json(&account))
             }
         })
         .boxed();
 
     // PUT /accounts/:username/settings
+    let outgoing_handler_clone = outgoing_handler;
     let put_account_settings = warp::put()
         .and(warp::path("accounts"))
         .and(admin_or_authorized_user_only.clone())
@@ -323,8 +337,16 @@ where
         .and(warp::path::end())
         .and(deserialize_json())
         .and(with_store.clone())
-        .and_then(|id: Uuid, settings: AccountSettings, store: S| {
+        .and_then(move |id: Uuid, settings: AccountSettings, store: S| {
+            let btp = btp.clone();
+            let outgoing_handler = outgoing_handler_clone.clone();
             async move {
+                if settings.ilp_over_btp_incoming_token.is_some() {
+                    // if the BTP token was provided, assume that it's different
+                    // from the existing one and drop the connection
+                    // the saved websocket connection
+                    btp.close_connection(&id);
+                }
                 let modified_account = store
                     .modify_account_settings(id, settings)
                     .map_err(move |_| {
@@ -332,6 +354,17 @@ where
                         Rejection::from(ApiError::internal_server_error())
                     })
                     .await?;
+
+                // Since the account was modified, we should also try to
+                // connect to the new account:
+                connect_to_external_services(
+                    outgoing_handler,
+                    modified_account.clone(),
+                    store,
+                    btp,
+                )
+                .await?;
+
                 Ok::<Json, Rejection>(warp::reply::json(&modified_account))
             }
         })

@@ -290,6 +290,7 @@ mod client_server {
             .await;
         assert!(res.is_ok());
 
+        // The server removes the connection with us
         btp_service.close_connection(&server_acc_id);
         // after removing the connection this will fail
         let mut btp_client_clone = btp_client.clone();
@@ -308,9 +309,10 @@ mod client_server {
                 .build(),
             });
         // This hangs unless we close the websocket also from the client side
-        // TODO: Figure out how to make the client side connection close automatically
+        // TODO: Figure out how to make the client side connection close automatically (delete the following line and make the test pass. Currently it fails because we close the connection and cannot reach them, while we want to timeout)
         btp_client.close_connection(&account.id());
         let res = res.await;
+        println!("got {:?}", res);
         assert!(res.is_err());
 
         btp_service.close();
