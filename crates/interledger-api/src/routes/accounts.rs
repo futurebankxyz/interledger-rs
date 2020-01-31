@@ -361,14 +361,16 @@ where
         .and(warp::path::end())
         .and(deserialize_json())
         .and(with_incoming_handler)
+        .and(with_store.clone())
         .and_then(
-            move |account: A, pay_request: SpspPayRequest, incoming_handler: I| {
+            move |account: A, pay_request: SpspPayRequest, incoming_handler: I, store: S| {
                 async move {
                     let receipt = pay(
                         incoming_handler,
                         account.clone(),
                         &pay_request.receiver,
                         pay_request.source_amount,
+                        store,
                     )
                     .map_err(|err| {
                         error!("Error sending SPSP payment: {:?}", err);

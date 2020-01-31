@@ -29,13 +29,16 @@ pub mod test_helpers {
     use async_trait::async_trait;
     use futures::channel::mpsc::UnboundedSender;
     use interledger_packet::Address;
+    use interledger_rates::ExchangeRateStore;
     use interledger_router::RouterStore;
     use interledger_service::{Account, AccountStore, AddressStore, Username};
+    use interledger_service_util::MaxPacketAmountAccount;
     use lazy_static::lazy_static;
     use std::collections::HashMap;
     use std::iter::FromIterator;
     use std::str::FromStr;
     use std::sync::Arc;
+    use tracing_subscriber;
     use uuid::Uuid;
 
     lazy_static! {
@@ -44,12 +47,21 @@ pub mod test_helpers {
         pub static ref ALICE: Username = Username::from_str("alice").unwrap();
     }
 
+    pub fn install_tracing_subscriber() {
+        tracing_subscriber::fmt::Subscriber::builder()
+            .with_timer(tracing_subscriber::fmt::time::ChronoUtc::rfc3339())
+            .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
+            .try_init()
+            .unwrap_or(());
+    }
+
     #[derive(Debug, Eq, PartialEq, Clone)]
     pub struct TestAccount {
         pub id: Uuid,
         pub ilp_address: Address,
         pub asset_scale: u8,
         pub asset_code: String,
+        pub max_packet_amount: Option<u64>,
     }
 
     impl Account for TestAccount {
@@ -71,6 +83,12 @@ pub mod test_helpers {
 
         fn ilp_address(&self) -> &Address {
             &self.ilp_address
+        }
+    }
+
+    impl MaxPacketAmountAccount for TestAccount {
+        fn max_packet_amount(&self) -> u64 {
+            self.max_packet_amount.unwrap_or(std::u64::MAX)
         }
     }
 
@@ -133,6 +151,27 @@ pub mod test_helpers {
             Address::from_str("example.connector").unwrap()
         }
     }
+
+    #[derive(Clone)]
+    pub struct TestRateStore {}
+
+    #[async_trait]
+    impl ExchangeRateStore for TestRateStore {
+        fn get_exchange_rates(&self, _asset_codes: &[&str]) -> Result<Vec<f64>, ()> {
+            Ok(vec![1.0, 3.0]) // TODO Boom!?
+        }
+
+        fn set_exchange_rates(&self, _rates: HashMap<String, f64>) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn get_all_exchange_rates(&self) -> Result<HashMap<String, f64>, ()> {
+            let mut ret = HashMap::new();
+            ret.insert("ABC".to_owned(), 1.0);
+            ret.insert("XYZ".to_owned(), 3.0);
+            Ok(ret)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +189,8 @@ mod send_money_to_receiver {
 
     #[tokio::test]
     async fn send_money_test() {
+        install_tracing_subscriber();
+
         let server_secret = Bytes::from(&[0; 32][..]);
         let destination_address = Address::from_str("example.receiver").unwrap();
         let account = TestAccount {
@@ -157,6 +198,7 @@ mod send_money_to_receiver {
             ilp_address: destination_address.clone(),
             asset_code: "XYZ".to_string(),
             asset_scale: 9,
+            max_packet_amount: None,
         };
         let store = TestStore {
             route: (destination_address.to_string(), account),
@@ -182,21 +224,27 @@ mod send_money_to_receiver {
             connection_generator.generate_address_and_secret(&destination_address);
 
         let destination_address = Address::from_str("example.receiver").unwrap();
-        let (receipt, _service) = send_money(
+        let receipt = send_money(
             server,
             &test_helpers::TestAccount {
                 id: Uuid::new_v4(),
                 asset_code: "XYZ".to_string(),
                 asset_scale: 9,
                 ilp_address: destination_address,
+                max_packet_amount: None,
             },
             destination_account,
             &shared_secret[..],
             100,
+            TestRateStore {},
         )
         .await
         .unwrap();
 
         assert_eq!(receipt.delivered_amount, 100);
     }
+
+    // TODO Add cross-currency test that succeeds
+
+    // TODO Add cross-currency test with too much slippage -> fails
 }
