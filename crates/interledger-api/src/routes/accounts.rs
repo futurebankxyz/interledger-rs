@@ -6,11 +6,12 @@ use interledger_ccp::{CcpRoutingAccount, Mode, RouteControlRequest, RoutingRelat
 use interledger_http::{deserialize_json, error::*, HttpAccount, HttpStore};
 use interledger_ildcp::IldcpRequest;
 use interledger_ildcp::IldcpResponse;
+use interledger_rates::ExchangeRateStore;
 use interledger_router::RouterStore;
 use interledger_service::{
     Account, AddressStore, IncomingService, OutgoingRequest, OutgoingService, Username,
 };
-use interledger_service_util::{BalanceStore, ExchangeRateStore};
+use interledger_service_util::BalanceStore;
 use interledger_settlement::core::types::SettlementAccount;
 use interledger_spsp::{pay, SpspResponder};
 use interledger_stream::{PaymentNotification, StreamNotificationsStore};
