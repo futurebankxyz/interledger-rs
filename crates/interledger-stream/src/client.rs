@@ -44,9 +44,9 @@ pub struct StreamDelivery {
     pub source_asset_code: String,
     /// Total amount *intended* to be sent, in source units
     pub source_amount: u64,
-    /// Amount fulfilled, in source units
+    /// Amount fulfilled or currently in-flight, in source units
     pub sent_amount: u64,
-    /// Amount of in-flight Prepares (yet to be fulfilled or rejected), in source units
+    /// Amount in-flight (yet to be fulfilled or rejected), in source units
     pub in_flight_amount: u64,
     /// Amount fulfilled and received by the recipient, in destination units
     pub delivered_amount: u64,
@@ -217,15 +217,16 @@ struct StreamPayment {
 impl StreamPayment {
     /// Account for and return amount to send in the next Prepare
     fn apply_prepare(&mut self) -> u64 {
-        let source_amount = min(
+        let amount = min(
             self.get_amount_available_to_send(),
             self.congestion_controller.get_max_amount(),
         );
 
-        // To prevent races, flow control and remaining amount MUST be adjusted when we determine the next packet amount
-        self.receipt.in_flight_amount += source_amount;
-        self.congestion_controller.prepare(source_amount);
-        source_amount
+        self.congestion_controller.prepare(amount);
+
+        self.receipt.sent_amount += amount;
+        self.receipt.in_flight_amount += amount;
+        amount
     }
 
     /// Account for a fulfilled packet and update flow control
@@ -233,7 +234,6 @@ impl StreamPayment {
         self.congestion_controller.fulfill(source_amount);
 
         self.receipt.in_flight_amount -= source_amount;
-        self.receipt.sent_amount += source_amount;
         self.receipt.delivered_amount += destination_amount;
 
         self.last_fulfill_time = Instant::now();
@@ -241,9 +241,12 @@ impl StreamPayment {
     }
 
     /// Account for a rejected packet and update flow control
-    fn apply_reject(&mut self, source_amount: u64, reject: &Reject) {
-        self.congestion_controller.reject(source_amount, reject);
-        self.receipt.in_flight_amount -= source_amount;
+    fn apply_reject(&mut self, amount: u64, reject: &Reject) {
+        self.congestion_controller.reject(amount, reject);
+
+        self.receipt.sent_amount -= amount;
+        self.receipt.in_flight_amount -= amount;
+
         self.rejected_packets += 1;
     }
 
@@ -260,19 +263,20 @@ impl StreamPayment {
         seq
     }
 
-    /// Return the amount of money remaining to be sent in the payment, subtracing in-flight amounts
+    /// Return the amount of money remaining to be sent in the payment
     fn get_amount_available_to_send(&self) -> u64 {
-        self.receipt.source_amount - self.receipt.sent_amount - self.receipt.in_flight_amount
+        // Sent amount also includes the amount in-flight, which should be subtracted from the amount available
+        self.receipt.source_amount - self.receipt.sent_amount
+    }
+
+    /// Has the entire intended source amount been fulfilled to the recipient?
+    fn is_complete(&self) -> bool {
+        (self.receipt.sent_amount - self.receipt.in_flight_amount) >= self.receipt.source_amount
     }
 
     /// Is the congestion controller restricting us from sending more money?
     fn is_max_in_flight(&self) -> bool {
         self.congestion_controller.get_max_amount() == 0
-    }
-
-    /// Has the entire intended source amount been fulfilled to the recipient?
-    fn is_complete(&self) -> bool {
-        self.receipt.sent_amount >= self.receipt.source_amount
     }
 }
 
@@ -553,9 +557,17 @@ where
             0.0
         };
 
-        let mut dest_amount = (source_amount as f64) * rate;
-        dest_amount = dest_amount * 10f64.powi((source_scale - dest_scale).into()); // Convert between asset scales
-        dest_amount = dest_amount.floor(); // For safety, always round down
+        // First, convert scaled source amount to base unit
+        let source_amount = (source_amount as f64) * 10f64.powi(-1 * source_scale as i32);
+
+        // Apply exchange rate
+        let mut dest_amount = source_amount * rate;
+
+        // Convert destination amount in base units to scaled units
+        dest_amount = dest_amount * 10f64.powi(dest_scale as i32);
+
+        // For safety, always round up
+        dest_amount = dest_amount.ceil();
         dest_amount as u64
     }
 }
@@ -688,6 +700,8 @@ mod send_money_tests {
         assert!(result.is_err());
         assert_eq!(num_requests_in_flight.load(Ordering::Relaxed), 5);
     }
+
+    // TODO Add other min destination amount tests
 
     // TODO Add 2 exchange rate tests
     // (1) If middleware takes out too much slippage... payment fails
