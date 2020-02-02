@@ -12,6 +12,10 @@ use interledger_packet::{
 use interledger_rates::ExchangeRateStore;
 use interledger_service::*;
 use log::{debug, error, warn};
+use num::rational::BigRational;
+use num::traits::cast::{FromPrimitive, ToPrimitive};
+use num::traits::identities::One;
+use num::traits::pow::pow;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -26,10 +30,6 @@ use std::time::SystemTime;
 /// Maximum time we should wait since last fulfill before we error out to avoid
 /// getting into an infinite loop of sending packets and effectively DoSing ourselves
 const MAX_TIME_SINCE_LAST_FULFILL: Duration = Duration::from_secs(30);
-
-/// Percentage subtracted from the calculated exchange rate to determine the minimum acceptable rate
-/// Used to account for fees and rate variations between connectors
-const DEFAULT_MAX_SLIPPAGE: f64 = 0.01;
 
 /// Receipt for STREAM payment to account for how much and what assets were sent & delivered
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -56,6 +56,23 @@ pub struct StreamDelivery {
     /// Receiver's asset code
     /// Updated after we received a `ConnectionAssetDetails` frame.
     pub destination_asset_code: Option<String>,
+}
+
+impl StreamDelivery {
+    pub fn new<A: Account>(from_account: &A, destination: Address, source_amount: u64) -> Self {
+        StreamDelivery {
+            from: from_account.ilp_address().clone(),
+            to: destination,
+            source_asset_scale: from_account.asset_scale(),
+            source_asset_code: from_account.asset_code().to_string(),
+            source_amount,
+            sent_amount: 0,
+            in_flight_amount: 0,
+            destination_asset_scale: None,
+            destination_asset_code: None,
+            delivered_amount: 0,
+        }
+    }
 }
 
 /// Stream payment mutable state: amounts & assets sent and received, sequence, packet counts, and flow control parameters
@@ -147,10 +164,11 @@ impl StreamPayment {
 pub async fn send_money<I, A, S>(
     service: I,
     from_account: &A,
+    store: S,
     destination_account: Address,
     shared_secret: &[u8],
     source_amount: u64,
-    store: S,
+    slippage: f64,
 ) -> Result<StreamDelivery, Error>
 where
     I: IncomingService<A> + Clone + Send + Sync + 'static,
@@ -175,18 +193,7 @@ where
     let payment = StreamPayment {
         // TODO Make configurable to get money flowing ASAP vs as much as possible per-packet
         congestion_controller: CongestionController::new(source_amount, source_amount / 10, 2.0),
-        receipt: StreamDelivery {
-            from,
-            to,
-            source_asset_scale: from_account.asset_scale(),
-            source_asset_code: from_account.asset_code().to_string(),
-            source_amount,
-            sent_amount: 0,
-            in_flight_amount: 0,
-            destination_asset_scale: None,
-            destination_asset_code: None,
-            delivered_amount: 0,
-        },
+        receipt: StreamDelivery::new(&from_account, destination_account, source_amount),
         should_send_source_account: true,
         sequence: 1,
         fulfilled_packets: 0,
@@ -199,7 +206,7 @@ where
         from_account,
         shared_secret,
         store,
-        slippage: DEFAULT_MAX_SLIPPAGE,
+        slippage,
         payment: Arc::new(Mutex::new(payment)),
     };
 
@@ -314,18 +321,35 @@ where
             let mut payment = self.payment.lock().await;
 
             // Build the STREAM packet
+
             let sequence = payment.next_sequence();
+
             let mut frames = vec![Frame::StreamMoney(StreamMoneyFrame {
                 stream_id: 1,
                 shares: 1,
             })];
+
             if payment.should_send_source_account {
                 frames.push(Frame::ConnectionNewAddress(ConnectionNewAddressFrame {
                     source_account: payment.receipt.from.clone(),
                 }));
             }
-            let min_destination_amount =
-                self.get_min_destination_amount(source_amount, &payment.receipt);
+
+            let min_destination_amount = get_min_destination_amount(
+                &self.store,
+                source_amount,
+                payment.receipt.source_asset_scale,
+                &payment.receipt.source_asset_code,
+                payment.receipt.destination_asset_scale,
+                payment
+                    .receipt
+                    .destination_asset_code
+                    .as_ref()
+                    .map(String::as_str),
+                self.slippage,
+            )
+            .unwrap_or(0); // Default to 0 if unable to calculate rate
+
             let stream_request_packet = StreamPacketBuilder {
                 ilp_packet_type: IlpPacketType::Prepare,
                 prepare_amount: min_destination_amount,
@@ -520,56 +544,54 @@ where
             .await
             .ok();
     }
+}
 
-    // TODO Abstract duplicated conversion logic from interledger-settlement &
-    //      exchange rate service into interledger-rates
+// TODO Abstract duplicated conversion logic from interledger-settlement &
+//      exchange rate service into interledger-rates
 
-    /// Convert the given source amount into a destination amount, pulling from a provider's exchange rates
-    /// and subtracting slippage to determine a minimum destination amount.
-    /// Returns 0 if destination asset details are unknown or rate cannot be calculated.
-    #[inline]
-    fn get_min_destination_amount(&self, source_amount: u64, receipt: &StreamDelivery) -> u64 {
-        let source_code = &receipt.source_asset_code;
-        let source_scale = receipt.source_asset_scale;
+/// Convert the given source amount into a destination amount, pulling from a provider's exchange rates
+/// and subtracting slippage to determine a minimum destination amount.
+/// Returns None if destination asset details are unknown or rate cannot be calculated.
+#[inline]
+fn get_min_destination_amount<S: ExchangeRateStore>(
+    store: &S,
+    source_amount: u64,
+    source_scale: u8,
+    source_code: &str,
+    dest_scale: Option<u8>,
+    dest_code: Option<&str>,
+    slippage: f64,
+) -> Option<u64> {
+    let dest_code = dest_code?;
+    let dest_scale = dest_scale?;
 
-        let (dest_code, dest_scale) = match (
-            &receipt.destination_asset_code,
-            receipt.destination_asset_scale,
-        ) {
-            (Some(dest_code), Some(dest_scale)) => (dest_code, dest_scale),
-            _ => {
-                return 0; // If we don't know the destination code *or* scale, default to 0
-            }
-        };
+    // Fetch the exchange rate
+    let rate: BigRational = if source_code == dest_code {
+        BigRational::one()
+    } else if let Ok(prices) = store.get_exchange_rates(&[&source_code, &dest_code]) {
+        BigRational::from_f64(prices[0])? / BigRational::from_f64(prices[1])?
+    } else {
+        return None;
+    };
 
-        let rate: f64 = if source_code == dest_code {
-            1f64
-        } else if let Ok(prices) = self.store.get_exchange_rates(&[&source_code, &dest_code]) {
-            prices[0] / prices[1]
-        } else {
-            return 0; // Default to 0 if the rate is unavailable
-        };
+    // Subtract slippage from rate
+    let slippage = BigRational::from_f64(slippage)?;
+    let rate = rate * (BigRational::one() - slippage);
 
-        let rate = rate * (1.0 - self.slippage);
-        let rate = if rate.is_finite() && rate.is_sign_positive() {
-            rate
-        } else {
-            0.0
-        };
+    // First, convert scaled source amount to base unit
+    let mut source_amount = BigRational::from_u64(source_amount)?;
+    source_amount /= pow(BigRational::from_u64(10)?, source_scale as usize);
 
-        // First, convert scaled source amount to base unit
-        let source_amount = (source_amount as f64) * 10f64.powi(-(source_scale as i32));
+    // Apply exchange rate
+    let mut dest_amount = source_amount * rate;
 
-        // Apply exchange rate
-        let mut dest_amount = source_amount * rate;
+    // Convert destination amount in base units to scaled units
+    dest_amount *= pow(BigRational::from_u64(10)?, dest_scale as usize);
 
-        // Convert destination amount in base units to scaled units
-        dest_amount *= 10f64.powi(dest_scale as i32);
+    // For safety, always round up
+    dest_amount = dest_amount.ceil();
 
-        // For safety, always round up
-        dest_amount = dest_amount.ceil();
-        dest_amount as u64
-    }
+    Some(dest_amount.to_integer().to_u64()?)
 }
 
 #[cfg(test)]
@@ -615,10 +637,14 @@ mod send_money_tests {
                 .build())
             })),
             &account,
+            TestRateStore {
+                price_1: None,
+                price_2: None,
+            },
             Address::from_str("example.destination").unwrap(),
             &[0; 32][..],
             100,
-            TestRateStore {},
+            0.0,
         )
         .await;
         assert!(result.is_err());
@@ -692,10 +718,14 @@ mod send_money_tests {
                 ilp_address: destination_address.clone(),
                 max_packet_amount: Some(10), // Requires at least 5 packets
             },
+            TestRateStore {
+                price_1: None,
+                price_2: None,
+            },
             destination_address.clone(),
             &[0; 32][..],
             50,
-            TestRateStore {},
+            0.0,
         )
         .await;
 
@@ -703,9 +733,209 @@ mod send_money_tests {
         assert_eq!(num_requests_in_flight.load(Ordering::Relaxed), 5);
     }
 
-    // TODO Add other min destination amount tests
+    #[tokio::test]
+    async fn computes_min_destination_amount() {
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: None,
+                price_2: Some(3.0),
+            },
+            100,
+            2,
+            "ABC",
+            Some(6),
+            Some("XYZ"),
+            0.0,
+        );
+        assert_eq!(dest_amount, None, "Fails if rate is unavailable");
 
-    // TODO Add 2 exchange rate tests
-    // (1) If middleware takes out too much slippage... payment fails
-    // (2) If middleware is acceptable slippage, cross-currency payment succeeds
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: Some(1.9),
+                price_2: Some(3.0),
+            },
+            100,
+            2,
+            "ABC",
+            Some(6),
+            None,
+            0.0,
+        );
+        assert_eq!(
+            dest_amount, None,
+            "Fails if destination asset code is unavailable"
+        );
+
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: Some(1.9),
+                price_2: Some(3.0),
+            },
+            100,
+            2,
+            "ABC",
+            None,
+            Some("ABC"),
+            0.03,
+        );
+        assert_eq!(
+            dest_amount, None,
+            "Fails if destination asset scale is unavailable"
+        );
+
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: Some(6.0),
+                price_2: Some(1.5),
+            },
+            100,
+            2,
+            "ABC",
+            Some(2),
+            Some("XYZ"),
+            0.0,
+        );
+        assert_eq!(
+            dest_amount,
+            Some(400),
+            "Computes result when amount gets larger"
+        );
+
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: Some(1.5),
+                price_2: Some(6.0),
+            },
+            100,
+            2,
+            "ABC",
+            Some(2),
+            Some("XYZ"),
+            0.0,
+        );
+        assert_eq!(
+            dest_amount,
+            Some(25),
+            "Computes result when amount gets smaller"
+        );
+
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: Some(1.0),
+                price_2: Some(1.0),
+            },
+            33,
+            2,
+            "ABC",
+            Some(6),
+            Some("XYZ"),
+            0.0,
+        );
+        assert_eq!(
+            dest_amount,
+            Some(330_000),
+            "Converts from small to large scales"
+        );
+
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: Some(1.0),
+                price_2: Some(1.0),
+            },
+            123_456_000_000,
+            9,
+            "ABC",
+            Some(4),
+            Some("XYZ"),
+            0.0,
+        );
+        assert_eq!(
+            dest_amount,
+            Some(1_234_560),
+            "Converts from large to small scales"
+        );
+
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: Some(1.0),
+                price_2: Some(1.0),
+            },
+            100,
+            2,
+            "ABC",
+            Some(2),
+            Some("XYZ"),
+            0.01,
+        );
+        assert_eq!(dest_amount, Some(99), "Subtracts slippage in simple case");
+
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: Some(1.0),
+                price_2: Some(1.0),
+            },
+            100,
+            2,
+            "ABC",
+            Some(2),
+            Some("XYZ"),
+            0.035,
+        );
+        assert_eq!(
+            dest_amount,
+            Some(97),
+            "Rounds amount up after subtracting slippage"
+        );
+
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: Some(0.000_000_5),
+                price_2: Some(1.0),
+            },
+            100,
+            0,
+            "ABC",
+            Some(0),
+            Some("XYZ"),
+            0.0,
+        );
+        assert_eq!(
+            dest_amount,
+            Some(1),
+            "Rounds up even when destination amount is very close to 0"
+        );
+
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: Some(1.0),
+                price_2: Some(1.0),
+            },
+            100,
+            9,
+            "ABC",
+            Some(9),
+            Some("XYZ"),
+            0.0,
+        );
+        // f64 multiplication errors would cause this to be 101 after rounding up, big rationals fix this
+        assert_eq!(dest_amount, Some(100), "No floating point errors");
+
+        let dest_amount = get_min_destination_amount(
+            &TestRateStore {
+                price_1: Some(1.0),
+                price_2: Some(1.0),
+            },
+            421,
+            255,
+            "ABC",
+            Some(255),
+            Some("XYZ"),
+            0.0,
+        );
+        assert_eq!(
+            dest_amount,
+            Some(421),
+            "Converts when using the largest possible scale"
+        );
+    }
 }

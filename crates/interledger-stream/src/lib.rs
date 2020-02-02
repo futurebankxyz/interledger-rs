@@ -153,23 +153,26 @@ pub mod test_helpers {
     }
 
     #[derive(Clone)]
-    pub struct TestRateStore {}
+    pub struct TestRateStore {
+        pub price_1: Option<f64>,
+        pub price_2: Option<f64>,
+    }
 
     #[async_trait]
     impl ExchangeRateStore for TestRateStore {
         fn get_exchange_rates(&self, _asset_codes: &[&str]) -> Result<Vec<f64>, ()> {
-            Ok(vec![1.0, 3.0]) // TODO Boom!?
+            match (self.price_1, self.price_2) {
+                (Some(price_1), Some(price_2)) => Ok(vec![price_1, price_2]),
+                _ => Err(()),
+            }
         }
 
         fn set_exchange_rates(&self, _rates: HashMap<String, f64>) -> Result<(), ()> {
-            Ok(())
+            unimplemented!("Cannot set exchange rates")
         }
 
         fn get_all_exchange_rates(&self) -> Result<HashMap<String, f64>, ()> {
-            let mut ret = HashMap::new();
-            ret.insert("ABC".to_owned(), 1.0);
-            ret.insert("XYZ".to_owned(), 3.0);
-            Ok(ret)
+            unimplemented!("Cannot get all exchange rates")
         }
     }
 }
@@ -233,10 +236,76 @@ mod send_money_to_receiver {
                 ilp_address: destination_address,
                 max_packet_amount: None,
             },
+            TestRateStore {
+                price_1: None,
+                price_2: None,
+            },
             destination_account,
             &shared_secret[..],
             100,
-            TestRateStore {},
+            0.0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(receipt.delivered_amount, 100);
+    }
+
+    // TODO Fix this
+    #[tokio::test]
+    async fn payment_fails_if_large_spread() {
+        install_tracing_subscriber();
+
+        let server_secret = Bytes::from(&[0; 32][..]);
+        let destination_address = Address::from_str("example.receiver").unwrap();
+        let account = TestAccount {
+            id: Uuid::new_v4(),
+            ilp_address: destination_address.clone(),
+            asset_code: "XYZ".to_string(),
+            asset_scale: 9,
+            max_packet_amount: None,
+        };
+        let store = TestStore {
+            route: (destination_address.to_string(), account),
+        };
+        let connection_generator = ConnectionGenerator::new(server_secret.clone());
+        let server = StreamReceiverService::new(
+            server_secret,
+            DummyStore,
+            outgoing_service_fn(|_| {
+                Err(RejectBuilder {
+                    code: ErrorCode::F02_UNREACHABLE,
+                    message: b"No other outgoing handler",
+                    triggered_by: Some(&EXAMPLE_RECEIVER),
+                    data: &[],
+                }
+                .build())
+            }),
+        );
+        let server = Router::new(store, server);
+        let server = IldcpService::new(server);
+
+        let (destination_account, shared_secret) =
+            connection_generator.generate_address_and_secret(&destination_address);
+
+        let destination_address = Address::from_str("example.receiver").unwrap();
+        let receipt = send_money(
+            server,
+            &test_helpers::TestAccount {
+                id: Uuid::new_v4(),
+                asset_code: "XYZ".to_string(),
+                asset_scale: 9,
+                ilp_address: destination_address,
+                max_packet_amount: None,
+            },
+            TestRateStore {
+                price_1: None,
+                price_2: None,
+            },
+            destination_account,
+            &shared_secret[..],
+            100,
+            0.0,
         )
         .await
         .unwrap();
