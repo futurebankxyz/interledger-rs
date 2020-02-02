@@ -31,6 +31,12 @@ use std::time::SystemTime;
 /// getting into an infinite loop of sending packets and effectively DoSing ourselves
 const MAX_TIME_SINCE_LAST_FULFILL: Duration = Duration::from_secs(30);
 
+/// Minimum number of packet attempts before defaulting to failure rate
+const FAIL_FAST_MINIMUM_PACKET_ATTEMPTS: u64 = 200;
+
+/// Minimum rate of rejected packets in order to terminate the payment
+const FAIL_FAST_MINIMUM_FAILURE_RATE: f64 = 0.99;
+
 /// Receipt for STREAM payment to account for how much and what assets were sent & delivered
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct StreamDelivery {
@@ -157,6 +163,13 @@ impl StreamPayment {
     fn is_max_in_flight(&self) -> bool {
         self.congestion_controller.get_max_amount() == 0
     }
+
+    /// Given we've attempted sending enough packets, does our rejected packet rate indicate the payment is failing?
+    fn is_failing(&self) -> bool {
+        let num_packets = self.fulfilled_packets + self.rejected_packets;
+        num_packets >= FAIL_FAST_MINIMUM_PACKET_ATTEMPTS
+            && (self.rejected_packets as f64 / num_packets as f64) > FAIL_FAST_MINIMUM_FAILURE_RATE
+    }
 }
 
 /// Send the given source amount with packetized Interledger payments using the STREAM transport protocol
@@ -178,7 +191,6 @@ where
     // TODO Can we avoid copying here?
     let shared_secret = Bytes::from(shared_secret);
 
-    let from_account = from_account.clone();
     let from = from_account.ilp_address().clone();
     let to = destination_account.clone();
 
@@ -190,24 +202,26 @@ where
         );
     }
 
-    let payment = StreamPayment {
-        // TODO Make configurable to get money flowing ASAP vs as much as possible per-packet
-        congestion_controller: CongestionController::new(source_amount, source_amount / 10, 2.0),
-        receipt: StreamDelivery::new(&from_account, destination_account, source_amount),
-        should_send_source_account: true,
-        sequence: 1,
-        fulfilled_packets: 0,
-        rejected_packets: 0,
-        last_fulfill_time: Instant::now(),
-    };
-
     let sender = StreamSender {
         next: service,
-        from_account,
+        from_account: from_account.clone(),
         shared_secret,
         store,
         slippage,
-        payment: Arc::new(Mutex::new(payment)),
+        payment: Arc::new(Mutex::new(StreamPayment {
+            // TODO Make configurable to get money flowing ASAP vs as much as possible per-packet
+            congestion_controller: CongestionController::new(
+                source_amount,
+                source_amount / 10,
+                2.0,
+            ),
+            receipt: StreamDelivery::new(from_account, destination_account, source_amount),
+            should_send_source_account: true,
+            sequence: 1,
+            fulfilled_packets: 0,
+            rejected_packets: 0,
+            last_fulfill_time: Instant::now(),
+        })),
     };
 
     let mut pending_requests = FuturesUnordered::new();
@@ -222,6 +236,8 @@ where
         CloseConnection,
         /// Maximum timeout since last fulfill has elapsed: terminate the payment
         Timeout,
+        /// Too many packets are rejected, such as if the exchange rate is too low: terminate the payment
+        FailFast,
     }
 
     loop {
@@ -230,6 +246,8 @@ where
 
             if payment.last_fulfill_time.elapsed() >= MAX_TIME_SINCE_LAST_FULFILL {
                 PaymentEvent::Timeout
+            } else if payment.is_failing() {
+                PaymentEvent::FailFast
             } else if payment.is_complete() {
                 PaymentEvent::CloseConnection
             } else if payment.is_max_in_flight() {
@@ -282,6 +300,14 @@ where
                 return Err(Error::TimeoutError(
                     "Time since last fulfill exceeded the maximum time limit".to_string(),
                 ));
+            }
+            PaymentEvent::FailFast => {
+                let payment = sender.payment.lock().await;
+                return Err(Error::SendMoneyError(
+                    format!("Terminating payment since too many packets are rejected ({} packets fulfilled, {} packets rejected)",
+                    payment.fulfilled_packets,
+                    payment.rejected_packets,
+                )));
             }
         }
     }
