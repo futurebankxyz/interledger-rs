@@ -188,7 +188,7 @@ async fn three_nodes() {
     let receipt = send_money_to_username(
         node1_http,
         node3_http,
-        1000000,
+        1_000_000,
         "charlie_on_c",
         "alice_on_a",
         "default account holder",
@@ -207,8 +207,8 @@ async fn three_nodes() {
         .starts_with("example.bob.charlie_on_b.charlie_on_c."));
     assert_eq!(receipt.source_asset_code, "XYZ");
     assert_eq!(receipt.source_asset_scale, 9);
-    assert_eq!(receipt.source_amount, 1000000);
-    assert_eq!(receipt.sent_amount, 1000000);
+    assert_eq!(receipt.source_amount, 1_000_000);
+    assert_eq!(receipt.sent_amount, 1_000_000);
     assert_eq!(receipt.in_flight_amount, 0);
     assert_eq!(receipt.delivered_amount, 1982);
     assert_eq!(receipt.destination_asset_code.unwrap(), "ABC");

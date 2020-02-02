@@ -58,6 +58,90 @@ pub struct StreamDelivery {
     pub destination_asset_code: Option<String>,
 }
 
+/// Stream payment mutable state: amounts & assets sent and received, sequence, packet counts, and flow control parameters
+struct StreamPayment {
+    /// The [congestion controller](./../congestion/struct.CongestionController.html) to adjust flow control and the in-flight amount
+    congestion_controller: CongestionController,
+    /// The [StreamDelivery](./struct.StreamDelivery.html) receipt to account for the delivered amounts
+    receipt: StreamDelivery,
+    /// Do we need to send our source account information to the recipient?
+    should_send_source_account: bool,
+    /// Monotonically increaing sequence number for this STREAM payment
+    sequence: u64,
+    /// Number of fulfilled packets throughout the STREAM payment
+    fulfilled_packets: u64,
+    /// Number of rejected packets throughout the STREAM payment
+    rejected_packets: u64,
+    /// Timestamp when a packet was last fulfilled for this payment
+    last_fulfill_time: Instant,
+}
+
+impl StreamPayment {
+    /// Account for and return amount to send in the next Prepare
+    fn apply_prepare(&mut self) -> u64 {
+        let amount = min(
+            self.get_amount_available_to_send(),
+            self.congestion_controller.get_max_amount(),
+        );
+
+        self.congestion_controller.prepare(amount);
+
+        self.receipt.sent_amount += amount;
+        self.receipt.in_flight_amount += amount;
+        amount
+    }
+
+    /// Account for a fulfilled packet and update flow control
+    fn apply_fulfill(&mut self, source_amount: u64, destination_amount: u64) {
+        self.congestion_controller.fulfill(source_amount);
+
+        self.receipt.in_flight_amount -= source_amount;
+        self.receipt.delivered_amount += destination_amount;
+
+        self.last_fulfill_time = Instant::now();
+        self.fulfilled_packets += 1;
+    }
+
+    /// Account for a rejected packet and update flow control
+    fn apply_reject(&mut self, amount: u64, reject: &Reject) {
+        self.congestion_controller.reject(amount, reject);
+
+        self.receipt.sent_amount -= amount;
+        self.receipt.in_flight_amount -= amount;
+
+        self.rejected_packets += 1;
+    }
+
+    /// Save the recipient's destination asset details for calculating minimum exchange rates
+    fn set_destination_asset_details(&mut self, asset_code: String, asset_scale: u8) {
+        self.receipt.destination_asset_code = Some(asset_code);
+        self.receipt.destination_asset_scale = Some(asset_scale);
+    }
+
+    /// Return the current sequence number and increment the value for subsequent packets
+    fn next_sequence(&mut self) -> u64 {
+        let seq = self.sequence;
+        self.sequence += 1;
+        seq
+    }
+
+    /// Return the amount of money remaining to be sent in the payment
+    fn get_amount_available_to_send(&self) -> u64 {
+        // Sent amount also includes the amount in-flight, which should be subtracted from the amount available
+        self.receipt.source_amount - self.receipt.sent_amount
+    }
+
+    /// Has the entire intended source amount been fulfilled to the recipient?
+    fn is_complete(&self) -> bool {
+        (self.receipt.sent_amount - self.receipt.in_flight_amount) >= self.receipt.source_amount
+    }
+
+    /// Is the congestion controller restricting us from sending more money?
+    fn is_max_in_flight(&self) -> bool {
+        self.congestion_controller.get_max_amount() == 0
+    }
+}
+
 /// Send the given source amount with packetized Interledger payments using the STREAM transport protocol
 /// Returns the receipt with sent & delivered amounts, asset & account details
 pub async fn send_money<I, A, S>(
@@ -157,7 +241,7 @@ where
             }
             PaymentEvent::MaxInFlight => {
                 // Wait for 100ms for any request to complete, otherwise try running loop again
-                // to see if we reached the timeout since lsat fulfill
+                // to see if we reached the timeout since last fulfill
                 let fut = timeout(
                     Duration::from_millis(100),
                     pending_requests.select_next_some(),
@@ -188,95 +272,11 @@ where
             }
             PaymentEvent::Timeout => {
                 // Error if we haven't received a fulfill over a timeout period
-                return Err(Error::TimeoutError(format!(
-                    "Time since last fulfill exceeded the maximum time limit"
-                )));
+                return Err(Error::TimeoutError(
+                    "Time since last fulfill exceeded the maximum time limit".to_string(),
+                ));
             }
         }
-    }
-}
-
-/// Stream payment mutable state: amounts & assets sent and received, sequence, packet counts, and flow control parameters
-struct StreamPayment {
-    /// The [congestion controller](./../congestion/struct.CongestionController.html) to adjust flow control and the in-flight amount
-    congestion_controller: CongestionController,
-    /// The [StreamDelivery](./struct.StreamDelivery.html) receipt to account for the delivered amounts
-    receipt: StreamDelivery,
-    /// Do we need to send our source account information to the recipient?
-    should_send_source_account: bool,
-    /// Monotonically increaing sequence number for this STREAM payment
-    sequence: u64,
-    /// Number of fulfilled packets throughout the STREAM payment
-    fulfilled_packets: u64,
-    /// Number of rejected packets throughout the STREAM payment
-    rejected_packets: u64,
-    /// Timestamp when a packet was last fulfilled for this payment
-    last_fulfill_time: Instant,
-}
-
-impl StreamPayment {
-    /// Account for and return amount to send in the next Prepare
-    fn apply_prepare(&mut self) -> u64 {
-        let amount = min(
-            self.get_amount_available_to_send(),
-            self.congestion_controller.get_max_amount(),
-        );
-
-        self.congestion_controller.prepare(amount);
-
-        self.receipt.sent_amount += amount;
-        self.receipt.in_flight_amount += amount;
-        amount
-    }
-
-    /// Account for a fulfilled packet and update flow control
-    fn apply_fulfill(&mut self, source_amount: u64, destination_amount: u64) {
-        self.congestion_controller.fulfill(source_amount);
-
-        self.receipt.in_flight_amount -= source_amount;
-        self.receipt.delivered_amount += destination_amount;
-
-        self.last_fulfill_time = Instant::now();
-        self.fulfilled_packets += 1;
-    }
-
-    /// Account for a rejected packet and update flow control
-    fn apply_reject(&mut self, amount: u64, reject: &Reject) {
-        self.congestion_controller.reject(amount, reject);
-
-        self.receipt.sent_amount -= amount;
-        self.receipt.in_flight_amount -= amount;
-
-        self.rejected_packets += 1;
-    }
-
-    /// Save the recipient's destination asset details for calculating minimum exchange rates
-    fn set_destination_asset_details(&mut self, asset_code: String, asset_scale: u8) {
-        self.receipt.destination_asset_code = Some(asset_code);
-        self.receipt.destination_asset_scale = Some(asset_scale);
-    }
-
-    /// Return the current sequence number and increment the value for subsequent packets
-    fn next_sequence(&mut self) -> u64 {
-        let seq = self.sequence;
-        self.sequence += 1;
-        seq
-    }
-
-    /// Return the amount of money remaining to be sent in the payment
-    fn get_amount_available_to_send(&self) -> u64 {
-        // Sent amount also includes the amount in-flight, which should be subtracted from the amount available
-        self.receipt.source_amount - self.receipt.sent_amount
-    }
-
-    /// Has the entire intended source amount been fulfilled to the recipient?
-    fn is_complete(&self) -> bool {
-        (self.receipt.sent_amount - self.receipt.in_flight_amount) >= self.receipt.source_amount
-    }
-
-    /// Is the congestion controller restricting us from sending more money?
-    fn is_max_in_flight(&self) -> bool {
-        self.congestion_controller.get_max_amount() == 0
     }
 }
 
@@ -558,13 +558,13 @@ where
         };
 
         // First, convert scaled source amount to base unit
-        let source_amount = (source_amount as f64) * 10f64.powi(-1 * source_scale as i32);
+        let source_amount = (source_amount as f64) * 10f64.powi(-(source_scale as i32));
 
         // Apply exchange rate
         let mut dest_amount = source_amount * rate;
 
         // Convert destination amount in base units to scaled units
-        dest_amount = dest_amount * 10f64.powi(dest_scale as i32);
+        dest_amount *= 10f64.powi(dest_scale as i32);
 
         // For safety, always round up
         dest_amount = dest_amount.ceil();
@@ -668,13 +668,15 @@ mod send_money_tests {
                     futures::future::pending::<IlpResult>(),
                 )
                 .await
-                .unwrap_or(Err(RejectBuilder {
-                    code: IlpErrorCode::F00_BAD_REQUEST,
-                    message: b"some final error",
-                    triggered_by: Some(&EXAMPLE_CONNECTOR),
-                    data: &[],
-                }
-                .build()))
+                .unwrap_or_else(|_| {
+                    Err(RejectBuilder {
+                        code: IlpErrorCode::F00_BAD_REQUEST,
+                        message: b"some final error",
+                        triggered_by: Some(&EXAMPLE_CONNECTOR),
+                        data: &[],
+                    }
+                    .build())
+                })
             }
         }
 
