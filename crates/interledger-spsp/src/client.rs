@@ -36,9 +36,10 @@ pub async fn query(server: &str) -> Result<SpspResponse, Error> {
 pub async fn pay<I, A, S>(
     service: I,
     from_account: A,
+    store: S,
     receiver: &str,
     source_amount: u64,
-    store: S,
+    slippage: f64,
 ) -> Result<StreamDelivery, Error>
 where
     I: IncomingService<A> + Clone + Send + Sync + 'static,
@@ -57,10 +58,11 @@ where
     let receipt = send_money(
         service,
         &from_account,
+        store,
         addr,
         &shared_secret,
         source_amount,
-        store,
+        slippage,
     )
     .map_err(move |err| {
         error!("Error sending payment: {:?}", err);
