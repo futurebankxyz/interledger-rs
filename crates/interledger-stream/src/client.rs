@@ -597,9 +597,7 @@ fn get_min_destination_amount<S: ExchangeRateStore>(
 #[cfg(test)]
 mod send_money_tests {
     use super::*;
-    use crate::test_helpers::{
-        install_tracing_subscriber, TestAccount, TestRateStore, TestStore, EXAMPLE_CONNECTOR,
-    };
+    use crate::test_helpers::{TestAccount, TestStore, EXAMPLE_CONNECTOR};
     use async_trait::async_trait;
     use interledger_ildcp::IldcpService;
     use interledger_packet::{ErrorCode as IlpErrorCode, RejectBuilder};
@@ -614,8 +612,6 @@ mod send_money_tests {
 
     #[tokio::test]
     async fn stops_at_final_errors() {
-        install_tracing_subscriber();
-
         let account = TestAccount {
             id: Uuid::new_v4(),
             asset_code: "XYZ".to_string(),
@@ -637,7 +633,8 @@ mod send_money_tests {
                 .build())
             })),
             &account,
-            TestRateStore {
+            TestStore {
+                route: None,
                 price_1: None,
                 price_2: None,
             },
@@ -653,8 +650,6 @@ mod send_money_tests {
 
     #[tokio::test]
     async fn sends_concurrent_packets() {
-        install_tracing_subscriber();
-
         let destination_address = Address::from_str("example.receiver").unwrap();
         let account = TestAccount {
             id: Uuid::new_v4(),
@@ -664,7 +659,9 @@ mod send_money_tests {
             max_packet_amount: Some(10),
         };
         let store = TestStore {
-            route: (destination_address.to_string(), account),
+            route: Some((destination_address.to_string(), account)),
+            price_1: None,
+            price_2: None,
         };
 
         #[derive(Clone)]
@@ -718,7 +715,8 @@ mod send_money_tests {
                 ilp_address: destination_address.clone(),
                 max_packet_amount: Some(10), // Requires at least 5 packets
             },
-            TestRateStore {
+            TestStore {
+                route: None,
                 price_1: None,
                 price_2: None,
             },
@@ -736,7 +734,8 @@ mod send_money_tests {
     #[tokio::test]
     async fn computes_min_destination_amount() {
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: None,
                 price_2: Some(3.0),
             },
@@ -750,7 +749,8 @@ mod send_money_tests {
         assert_eq!(dest_amount, None, "Fails if rate is unavailable");
 
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: Some(1.9),
                 price_2: Some(3.0),
             },
@@ -767,7 +767,8 @@ mod send_money_tests {
         );
 
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: Some(1.9),
                 price_2: Some(3.0),
             },
@@ -784,7 +785,8 @@ mod send_money_tests {
         );
 
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: Some(6.0),
                 price_2: Some(1.5),
             },
@@ -802,7 +804,8 @@ mod send_money_tests {
         );
 
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: Some(1.5),
                 price_2: Some(6.0),
             },
@@ -820,7 +823,8 @@ mod send_money_tests {
         );
 
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: Some(1.0),
                 price_2: Some(1.0),
             },
@@ -838,7 +842,8 @@ mod send_money_tests {
         );
 
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: Some(1.0),
                 price_2: Some(1.0),
             },
@@ -856,7 +861,8 @@ mod send_money_tests {
         );
 
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: Some(1.0),
                 price_2: Some(1.0),
             },
@@ -870,7 +876,8 @@ mod send_money_tests {
         assert_eq!(dest_amount, Some(99), "Subtracts slippage in simple case");
 
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: Some(1.0),
                 price_2: Some(1.0),
             },
@@ -888,7 +895,8 @@ mod send_money_tests {
         );
 
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: Some(0.000_000_5),
                 price_2: Some(1.0),
             },
@@ -906,7 +914,8 @@ mod send_money_tests {
         );
 
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: Some(1.0),
                 price_2: Some(1.0),
             },
@@ -921,7 +930,8 @@ mod send_money_tests {
         assert_eq!(dest_amount, Some(100), "No floating point errors");
 
         let dest_amount = get_min_destination_amount(
-            &TestRateStore {
+            &TestStore {
+                route: None,
                 price_1: Some(1.0),
                 price_2: Some(1.0),
             },
